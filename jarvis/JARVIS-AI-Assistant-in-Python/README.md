@@ -3,15 +3,47 @@
 From `D:\python`, activate the virtual environment and run the script from its project directory:
 
 ```powershell
-& D:\python\JARVIS-AI-Assistant-in-Python\.venv\Scripts\Activate.ps1
-Set-Location D:\python\JARVIS-AI-Assistant-in-Python
-python -m pip install SpeechRecognition pyttsx3 PyAudioWPatch google-genai pyautogui
+& D:\python\jarvis\JARVIS-AI-Assistant-in-Python\.venv\Scripts\Activate.ps1
+Set-Location D:\python\jarvis\JARVIS-AI-Assistant-in-Python
+python -m pip install -r requirements.txt
 python voice_assistant.py
 ```
 
-This opens the futuristic desktop interface. Use `python voice_assistant.py --terminal` to use the console interface instead.
+This opens the cinematic sci-fi HUD (CustomTkinter): animated arc-reactor core, neon glow palettes, sonar ripples while listening, scan sweeps while thinking, live memory/disk telemetry, a typewriter mission log, and quick-command chips. Voice recognition runs automatically when a microphone is available; typed commands always work. Use `python voice_assistant.py --terminal` for the console interface instead, or run `python jarvis_sci_fi_ui.py` to preview the HUD in standalone demo mode.
 
 The script is located in `JARVIS-AI-Assistant-in-Python`, so `python voice_assistant.py` will fail if it is run directly from `D:\python`.
+
+## Troubleshooting
+
+### `[ui] sci-fi HUD unavailable ... falling back to terminal mode` or `The sci-fi HUD requires the 'customtkinter' package`
+
+JARVIS was launched with an interpreter that does not have CustomTkinter (for example the global Python instead of the project `.venv`). Launch it with the virtual environment:
+
+```powershell
+& D:\python\jarvis\JARVIS-AI-Assistant-in-Python\.venv\Scripts\Activate.ps1
+Set-Location D:\python\jarvis\JARVIS-AI-Assistant-in-Python
+python -m pip install -r requirements.txt
+python voice_assistant.py
+```
+
+In VS Code, press `Ctrl+Shift+P` → **Python: Select Interpreter** and choose the `.venv` one (`D:\python\jarvis\JARVIS-AI-Assistant-in-Python\.venv\Scripts\python.exe`) before running or debugging. JARVIS never hard-crashes because of this: without the HUD package it automatically runs in terminal mode.
+
+### "I could not reach Gemini" / `Gemini is not configured`
+
+Run the masked diagnostic first — it classifies missing keys, rejected keys, retired models, quota exhaustion and offline states without ever printing your key:
+
+```powershell
+python gemini_probe.py
+```
+
+Key facts:
+
+- The key lives in `.env` next to the app (or a User-level Windows variable `GEMINI_API_KEY`). Both work for scripts **and** `JARVIS.exe`.
+- Ask questions explicitly with `ask <question>`; unknown phrases also route to Gemini.
+- `ask_gemini` automatically walks models newest-first (override via `JARVIS_GEMINI_MODEL`) and retries transient blips once; specific spoken errors mean specific causes:
+  - *"access was rejected"* → replace the key
+  - *"quota is exhausted"* → wait or raise limits
+  - *"lost the connection… mid-request"* → retry shortly; usually transient VPN/Wi-Fi
 
 ## Capabilities
 
@@ -108,7 +140,21 @@ To verify the installation without using the microphone:
 python voice_assistant.py --self-test
 ```
 
+To verify the sci-fi HUD renders and animates correctly without touching the microphone or network:
+
+```powershell
+python test_ui_smoke.py
+```
+
 Set `JARVIS_MUSIC_DIR` before launching if your music is stored somewhere other than your user Music folder.
+
+For continuous microphone mode, run:
+
+```powershell
+python voice_assistant.py --continuous
+```
+
+JARVIS reads `daily_tasks.txt` at startup and speaks its contents. Edit that file to set the daily task list, or set `JARVIS_DAILY_TASKS_FILE` to use another local file. On Windows, launching JARVIS registers it to start in continuous microphone mode at the next user login.
 
 ## Gemini AI
 

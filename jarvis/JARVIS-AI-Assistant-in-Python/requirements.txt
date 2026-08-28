@@ -1,0 +1,7 @@
+SpeechRecognition
+pyttsx3
+PyAudioWPatch
+google-genai
+pyautogui
+python-dotenv
+customtkinter

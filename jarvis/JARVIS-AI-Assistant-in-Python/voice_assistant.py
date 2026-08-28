@@ -1,9 +1,10 @@
 """JARVIS: a voice-first desktop assistant with a typed fallback."""
 
+from dotenv import load_dotenv
+
 import ast
 import datetime as dt
 import json
-import math
 import operator
 import os
 import platform
@@ -17,10 +18,11 @@ import threading
 import time
 import urllib.parse
 import webbrowser
+try:
+    import winreg
+except ImportError:
+    winreg = None
 from pathlib import Path
-
-import tkinter as tk
-from tkinter import scrolledtext
 
 try:
     import pyaudiowpatch as pyaudio
@@ -44,12 +46,50 @@ except ImportError:
     pyautogui = None
 
 try:
-    from google import genai
+    from google import genai  # modern google-genai SDK
 except ImportError:
     genai = None
 
+# Cinematic sci-fi desktop window (CustomTkinter). Imported as JarvisWindow so
+# the launch entry point below stays unchanged. ANY failure here (customtkinter
+# not installed, broken install, GUI library unavailable) leaves JarvisWindow
+# as None so the app falls back to terminal mode instead of crashing.
+try:
+    from jarvis_sci_fi_ui import SciFiWindow as JarvisWindow
+except Exception:
+    JarvisWindow = None
+
 APP_NAME = "J.A.R.V.I.S."
-NOTES_FILE = Path(__file__).with_name("jarvis_notes.json")
+
+
+def _is_frozen():
+    """True when running as a PyInstaller executable."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def app_dir():
+    """Directory holding user-facing files.
+
+    Development mode: alongside voice_assistant.py. Frozen one-file builds
+    extract into a temporary _MEIPASS directory, so instead we anchor to the
+    folder containing JARVIS.exe — letting users drop .env / daily_tasks.txt
+    next to wherever the executable lives and have their data persist there.
+    """
+    if _is_frozen():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+# Configuration loading happens here (after sys/pathlib are ready) rather than
+# at import top so the frozen-build locations above are known. override=True
+# ensures a fresh .env value wins over any stale GEMINI_API_KEY left over in
+# the Windows/system environment.
+load_dotenv(app_dir() / ".env", override=True)
+
+NOTES_FILE = app_dir() / "jarvis_notes.json"
+DAILY_TASKS_FILE = Path(
+    os.environ.get("JARVIS_DAILY_TASKS_FILE", str(app_dir() / "daily_tasks.txt"))
+)
 MUSIC_DIR = Path(os.environ.get("JARVIS_MUSIC_DIR", Path.home() / "Music"))
 APP_COMMANDS = {
     "notepad": "notepad.exe",
@@ -65,6 +105,10 @@ class JarvisAssistant:
     def __init__(self, voice_enabled=True, output_callback=None):
         self.voice_enabled = voice_enabled and pyttsx3 is not None
         self.output_callback = output_callback
+        # Optional UI hooks: fired by the TTS worker when playback starts and
+        # finishes, letting the sci-fi HUD animate the SPEAKING state.
+        self.on_speak_start = None
+        self.on_speak_end = None
         self.last_listen_error = ""
         self.last_tts_error = ""
         self.engine = None
@@ -79,6 +123,16 @@ class JarvisAssistant:
             "I told my computer I needed a break. It said, 'No problem, I will go to sleep.'",
         ]
         self.speak("As-salamu alaykum Farhan", wait=False)
+        daily_tasks = self.load_daily_tasks()
+        if daily_tasks:
+            self.speak(f" what your Today's tasks:\n{daily_tasks}", wait=False)
+
+    @staticmethod
+    def load_daily_tasks():
+        try:
+            return DAILY_TASKS_FILE.read_text(encoding="utf-8").strip()
+        except (FileNotFoundError, OSError):
+            return ""
 
     @staticmethod
     def _init_gemini():
@@ -91,20 +145,86 @@ class JarvisAssistant:
             print(f"[gemini] Client unavailable: {error}")
             return None
 
+    @staticmethod
+    def _classify_gemini_error(error):
+        """Bucket a Gemini SDK exception into speech-worthy categories."""
+        text = f"{error}".lower()
+        if "not found" in text or "404" in text:
+            return "retired"
+        if "429" in text or "quota" in text or "resource_exhausted" in text:
+            return "quota"
+        if any(tag in text for tag in (
+            "timed out", "timeout", "connection", "network", "getaddrinfo",
+            "proxy", "503", "500", "internal error", "temporarily unavailable",
+        )):
+            return "transient"
+        if any(tag in text for tag in (
+            "api_key_invalid", "api key not valid", "invalid api key",
+            "permission_denied", "unauthenticated", "403", "401",
+        )):
+            return "rejected"
+        return "other"
+
+    def _speak_gemini_failure(self, error):
+        kind = self._classify_gemini_error(error)
+        spoken = {
+            "rejected": "My Gemini access was rejected. The API key appears invalid or lacks permission.",
+            "quota": "Gemini answered my handshake, but the request quota is exhausted for now.",
+            "retired": "None of my known Gemini models are available anymore. Update my model list.",
+            "transient": "I lost the connection to Google mid-request. Please try again shortly.",
+        }.get(kind, "I could not reach Gemini. Check your API key and internet connection.")
+        print(f"[gemini] Request failed ({kind}): {error}")
+        self.speak(spoken)
+
+    @staticmethod
+    def _gemini_model_candidates():
+        """Newest-first model chain: env override, then known-good names."""
+        ordered = [
+            os.environ.get("JARVIS_GEMINI_MODEL") or None,
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-2.5-flash",
+        ]
+        unique = []
+        for model in ordered:
+            if model and model not in unique:
+                unique.append(model)
+        return tuple(unique)
+
     def ask_gemini(self, question):
         if not self.gemini_client:
             self.speak("Gemini is not configured. Set GEMINI_API_KEY and restart JARVIS.")
             return
-        try:
-            response = self.gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=question,
-            )
-            answer = (response.text or "Gemini returned an empty response.").strip()
-            self.speak(answer)
-        except Exception as error:
-            print(f"[gemini] Request failed: {error}")
-            self.speak("I could not reach Gemini. Check your API key and internet connection.")
+
+        last_error = None
+        for model in self._gemini_model_candidates():
+            retries_left = 1
+            while True:
+                try:
+                    response = self.gemini_client.models.generate_content(
+                        model=model,
+                        contents=question,
+                    )
+                except Exception as error:
+                    last_error = error
+                    state = self._classify_gemini_error(error)
+                    if state == "retired":
+                        print(f"[gemini] {model} unavailable; trying next model.")
+                        break                                    # next model
+                    if state in {"quota", "transient"} and retries_left:
+                        retries_left -= 1
+                        time.sleep(1.5 if state == "transient" else 0.8)
+                        continue                                 # one patient retry
+                    self._speak_gemini_failure(error)            # hard stop
+                    return
+                try:
+                    answer = (response.text or "").strip()
+                except ValueError:
+                    answer = ""
+                self.speak(answer or "Gemini returned an empty response.")
+                return
+        # Every candidate ended in 'retired'-style failures.
+        self._speak_gemini_failure(last_error)
 
     @staticmethod
     def _init_tts():
@@ -137,6 +257,7 @@ class JarvisAssistant:
                 self.engine = self._init_tts()
                 if self.engine is None:
                     raise RuntimeError("Text-to-speech engine could not be initialized")
+                self._fire_speech_hook("on_speak_start", str(text))
                 self.engine.say(text)
                 self.engine.runAndWait()
                 self.last_tts_error = ""
@@ -153,6 +274,16 @@ class JarvisAssistant:
                 self.engine = None
                 finished.set()
                 self.tts_queue.task_done()
+                # Notify after waiters so the HUD settles right as speech ends.
+                self._fire_speech_hook("on_speak_end", str(text))
+
+    def _fire_speech_hook(self, name, text=None):
+        hook = getattr(self, name, None)
+        if callable(hook):
+            try:
+                hook(text)
+            except Exception as error:
+                print(f"[audio] {name} hook failed: {error}")
 
     def speak(self, text, wait=True):
         text = str(text).strip()
@@ -168,6 +299,8 @@ class JarvisAssistant:
                 finished.wait()
 
     def shutdown(self):
+        if hasattr(self, "audio_stop_event"):
+            self.audio_stop_event.set()
         if self.tts_thread and self.tts_thread.is_alive():
             self.tts_queue.put((None, None))
 
@@ -258,6 +391,117 @@ class JarvisAssistant:
             except EOFError:
                 return "stop"
         return ""
+
+    def start_audio_listener(self, on_command, on_status=None):
+        if getattr(self, "audio_thread", None) and self.audio_thread.is_alive():
+            return self.audio_thread
+        self.audio_stop_event = threading.Event()
+        self.audio_thread = threading.Thread(
+            target=self._audio_loop,
+            args=(on_command, on_status),
+            daemon=True,
+        )
+        self.audio_thread.start()
+        return self.audio_thread
+
+    def _audio_loop(self, on_command, on_status):
+        if sr is None or pyaudio is None:
+            if on_status:
+                on_status("Speech listener unavailable; use typed input.")
+            return
+        device_indexes = self.input_devices()
+        if not device_indexes:
+            if on_status:
+                on_status("No microphone detected; use typed input.")
+            return
+
+        recognizer = sr.Recognizer()
+        last_error = None
+        for device_index in device_indexes:
+            try:
+                with sr.Microphone(device_index=device_index) as source:
+                    recognizer.adjust_for_ambient_noise(source, duration=0.4)
+                    if on_status:
+                        on_status(f"Listening continuously on device {device_index}...")
+                    while not self.audio_stop_event.is_set():
+                        try:
+                            audio = recognizer.listen(source, timeout=1, phrase_time_limit=6)
+                        except sr.WaitTimeoutError:
+                            continue
+                        try:
+                            query = recognizer.recognize_google(audio, language="en-in").lower().strip()
+                        except sr.UnknownValueError:
+                            continue
+                        except sr.RequestError:
+                            self.last_listen_error = "Speech recognition network unavailable."
+                            if on_status:
+                                on_status(self.last_listen_error)
+                            self.audio_stop_event.wait(3)
+                            continue
+
+                        if query and not self.audio_stop_event.is_set():
+                            if on_command(query) is False:
+                                self.audio_stop_event.set()
+                                return
+                return
+            except (OSError, ValueError) as error:
+                last_error = error
+
+        self.last_listen_error = str(last_error) if last_error else "No microphone could be opened."
+        if on_status:
+            on_status(f"Microphone unavailable: {self.last_listen_error}")
+
+    def run_continuously(self):
+        if sr is None or pyaudio is None:
+            self.speak("Continuous listening is unavailable. Speech recognition is not installed.")
+            return
+        self.audio_stop_event = threading.Event()
+        recognizer = sr.Recognizer()
+        while not self.audio_stop_event.is_set():
+            device_indexes = self.input_devices()
+            if not device_indexes:
+                self.last_listen_error = "No microphone was detected."
+                print(f"  [{self.last_listen_error} Retrying in 3 seconds...]")
+                self.audio_stop_event.wait(3)
+                continue
+
+            microphone_opened = False
+            for device_index in device_indexes:
+                if self.audio_stop_event.is_set():
+                    return
+                try:
+                    with sr.Microphone(device_index=device_index) as source:
+                        microphone_opened = True
+                        print("  Calibrating background noise...")
+                        recognizer.adjust_for_ambient_noise(source, duration=1)
+                        print(f"  Assistant is actively listening on device {device_index}...")
+                        while not self.audio_stop_event.is_set():
+                            try:
+                                audio = recognizer.listen(source, timeout=1, phrase_time_limit=5)
+                            except sr.WaitTimeoutError:
+                                continue
+                            try:
+                                query = recognizer.recognize_google(audio, language="en-in").lower().strip()
+                            except sr.UnknownValueError:
+                                continue
+                            except sr.RequestError:
+                                self.last_listen_error = "Speech recognition network unavailable."
+                                print(f"  [{self.last_listen_error} Retrying...]")
+                                self.audio_stop_event.wait(3)
+                                continue
+
+                            if query:
+                                print(f"  YOU > {query}")
+                                if not self.handle(query):
+                                    self.audio_stop_event.set()
+                                    return
+                    break
+                except (OSError, ValueError) as error:
+                    self.last_listen_error = str(error)
+                    print(f"  [microphone {device_index} unavailable: {error}]")
+
+            if not microphone_opened:
+                self.audio_stop_event.wait(3)
 
     def load_notes(self):
         try:
@@ -520,13 +764,13 @@ class JarvisAssistant:
         return False
 
     def handle(self, query):
-        query = query.strip().lower()
+        query = re.sub(r"[.!?,]+$", "", query.strip().lower()).strip()
         if query.startswith("jarvis "):
             query = query[7:].strip()
         if not query:
             return True
         if query in {"stop", "stop listening", "stop assistant", "exit", "quit", "shutdown"}:
-            self.speak("Powering down. See you soon.")
+            self.speak("Powering down. See you soon.", wait=False)
             return False
         if query in {"help", "commands", "what can you do"}:
             self.speak("""
@@ -691,248 +935,55 @@ class JarvisAssistant:
             self.speak(random.choice(self.jokes))
         elif "who are you" in query or "your name" in query:
             self.speak("I am JARVIS, a local Python voice interface with a growing memory.")
+        elif self.gemini_client:
+            self.ask_gemini(query)
         else:
             self.speak("Command not recognized. Say help to view my capabilities.")
         return True
 
-    def run(self):
+    def run(self, continuous=False):
         self.hud()
         self.speak("Starting neural interface.")
         time.sleep(0.3)
-        while self.handle(self.listen()):
-            pass
+        if continuous:
+            self.run_continuously()
+            return
+        if sr is None or pyaudio is None or not self.input_devices():
+            print("  Audio listener unavailable. Falling back to typed commands.")
+            while self.handle(self.listen()):
+                pass
+            return
 
-
-class JarvisGUI:
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("J.A.R.V.I.S. // Neural Interface")
-        self.root.geometry("1180x760")
-        self.root.minsize(900, 620)
-        self.root.configure(bg="#030a10")
-        self.assistant = JarvisAssistant(voice_enabled=True, output_callback=self.write_assistant_log)
-        self.command_running = False
-        self.voice_running = False
-        self.audio_mode = "idle"
-        self.wave_phase = 0
-        self.build_interface()
-        self.write_log("SYSTEM ONLINE // AWAITING INPUT", "system")
-        self.animate_hud()
-        self.root.protocol("WM_DELETE_WINDOW", self.close)
-
-    def build_interface(self):
-        self.root.grid_columnconfigure(0, weight=1)
-        self.root.grid_rowconfigure(1, weight=1)
-        self.header = tk.Canvas(self.root, height=92, bg="#030a10", highlightthickness=0)
-        self.header.grid(row=0, column=0, sticky="ew")
-        self.header.bind("<Configure>", self.draw_header)
-
-        body = tk.Frame(self.root, bg="#030a10")
-        body.grid(row=1, column=0, sticky="nsew", padx=28, pady=(0, 24))
-        body.grid_columnconfigure(0, weight=3)
-        body.grid_columnconfigure(1, weight=2)
-        body.grid_rowconfigure(1, weight=1)
-
-        self.hud = tk.Canvas(body, bg="#06121a", highlightthickness=0)
-        self.hud.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 18))
-        self.hud.bind("<Configure>", self.draw_hud)
-        self.hud.create_text(26, 24, text="PRIMARY COGNITIVE CORE", anchor="w",
-                             fill="#5de8dc", font=("Consolas", 10, "bold"))
-
-        history_frame = tk.Frame(body, bg="#06121a")
-        history_frame.grid(row=0, column=1, sticky="nsew")
-        history_frame.grid_rowconfigure(1, weight=1)
-        history_frame.grid_columnconfigure(0, weight=1)
-        tk.Label(history_frame, text="COMMAND HISTORY // LOCAL", anchor="w",
-                 font=("Consolas", 10, "bold"), fg="#5de8dc", bg="#06121a").grid(
-                     row=0, column=0, sticky="ew", padx=18, pady=(18, 10))
-        self.history = scrolledtext.ScrolledText(
-            history_frame, bg="#041019", fg="#f0c978", insertbackground="#5de8dc",
-            relief="flat", borderwidth=0, wrap="word", font=("Consolas", 10),
-            padx=16, pady=14, highlightthickness=1, highlightbackground="#174753",
+        self.start_audio_listener(
+            lambda query: self.handle(query),
+            lambda message: print(f"  [wake word] {message}"),
         )
-        self.history.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
-        self.history.configure(state="disabled")
+        try:
+            while self.audio_thread.is_alive():
+                time.sleep(0.2)
+        except KeyboardInterrupt:
+            self.shutdown()
 
-        content = tk.Frame(body, bg="#06121a")
-        content.grid(row=1, column=1, sticky="nsew")
-        content.grid_columnconfigure(0, weight=1)
-        content.grid_rowconfigure(1, weight=1)
-        tk.Label(content, text="LIVE RESPONSE STREAM", anchor="w", font=("Consolas", 9, "bold"),
-                 fg="#5de8dc", bg="#06121a").grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 8))
-        self.log = scrolledtext.ScrolledText(content, bg="#041019", fg="#d7f7f2",
-                                             insertbackground="#5de8dc", relief="flat",
-                                             font=("Consolas", 10), padx=16, pady=14,
-                                             highlightthickness=1, highlightbackground="#174753")
-        self.log.grid(row=1, column=0, sticky="nsew", padx=14)
-        self.log.tag_configure("system", foreground="#62e6d5")
-        self.log.tag_configure("user", foreground="#f2c879")
-        self.log.tag_configure("assistant", foreground="#d7f7f2")
-        self.log.configure(state="disabled")
 
-        controls = tk.Frame(body, bg="#030a10")
-        controls.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(18, 0))
-        controls.grid_columnconfigure(0, weight=1)
-        self.command = tk.Entry(controls, bg="#061b25", fg="#d7f7f2", insertbackground="#5de8dc",
-                    relief="flat", font=("Consolas", 12), highlightthickness=1,
-                    highlightbackground="#1a5860", highlightcolor="#5de8dc")
-        self.command.grid(row=0, column=0, sticky="ew", ipady=10, padx=(0, 10))
-        self.command.bind("<Return>", lambda _event: self.submit())
-        self.action_button(controls, "TRANSMIT", self.submit, row=0, column=1)
-        self.voice_button = self.action_button(controls, "VOICE LINK", self.start_voice, row=0, column=2)
-
-    def action_button(self, parent, label, action, row=None, column=None):
-        button = tk.Button(parent, text=label, command=action, bg="#082c36", fg="#5de8dc",
-                           activebackground="#105b61", activeforeground="#ffffff", relief="flat",
-                           bd=0, font=("Consolas", 9, "bold"), padx=14, pady=10, cursor="hand2",
-                           highlightthickness=1, highlightbackground="#1c6970")
-        if row is None:
-            button.pack(fill="x", padx=14, pady=4)
+# The classic desktop window was replaced by the cinematic sci-fi HUD in
+# jarvis_sci_fi_ui.py, imported at the top of this file as `JarvisWindow`.
+def configure_windows_startup():
+    if sys.platform != "win32" or winreg is None:
+        return
+    try:
+        if getattr(sys, "frozen", False):
+            startup_command = f'"{sys.executable}" --continuous'
         else:
-            button.grid(row=row, column=column, padx=(0 if column == 1 else 8, 0), sticky="ew")
-        return button
-
-    def write_log(self, text, tag):
-        self.log.configure(state="normal")
-        self.log.insert("end", f"\n  {text}\n", tag)
-        self.log.see("end")
-        self.log.configure(state="disabled")
-
-    def write_history(self, query):
-        self.history.configure(state="normal")
-        self.history.insert("end", f"> {query}\n")
-        self.history.see("end")
-        self.history.configure(state="disabled")
-
-    def write_assistant_log(self, text):
-        self.audio_mode = "speaking"
-        self.root.after(0, lambda: self.write_log(f"{APP_NAME} > {text}", "assistant"))
-        self.root.after(0, lambda: self.root.after(1700, self.reset_audio_mode))
-
-    def reset_audio_mode(self):
-        if self.audio_mode == "speaking":
-            self.audio_mode = "idle"
-
-    def draw_header(self, _event=None):
-        width = self.header.winfo_width()
-        self.header.delete("all")
-        self.header.create_text(28, 28, text="J.A.R.V.I.S.", anchor="w", fill="#72f5e5",
-                                font=("Consolas", 25, "bold"))
-        self.header.create_text(30, 58, text="NEURAL DESKTOP INTERFACE  //  SECURE LOCAL MODE",
-                                anchor="w", fill="#5b8793", font=("Consolas", 9))
-        self.header.create_line(28, 82, max(28, width - 28), 82, fill="#29b8b4", width=2)
-        self.header.create_line(max(28, width - 210), 82, max(28, width - 28), 82, fill="#f0c978", width=2)
-
-    def draw_hud(self, _event=None):
-        width, height = self.hud.winfo_width(), self.hud.winfo_height()
-        if width < 10 or height < 10:
-            return
-        self.hud.delete("dynamic")
-        cx, cy = width * 0.48, height * 0.54
-        radius = min(width, height) * 0.28
-        for offset, color in ((0, "#1e8f91"), (9, "#115b68"), (22, "#0c3a49")):
-            self.hud.create_oval(cx - radius - offset, cy - radius - offset,
-                                 cx + radius + offset, cy + radius + offset,
-                                 outline=color, width=1, tags="dynamic")
-        self.hud.create_arc(cx - radius - 10, cy - radius - 10, cx + radius + 10, cy + radius + 10,
-                            start=(self.wave_phase * 3) % 360, extent=78, outline="#f0c978",
-                            width=2, tags="dynamic")
-        self.hud.create_text(cx, cy - 12, text="J", fill="#76fff0", font=("Consolas", 48, "bold"), tags="dynamic")
-        self.hud.create_text(cx, cy + 36, text="CORE ONLINE", fill="#5de8dc", font=("Consolas", 9, "bold"), tags="dynamic")
-        for index in range(32):
-            angle = (index / 32) * 6.283
-            inner = radius + 30
-            outer = inner + (12 if index % 4 == 0 else 5)
-            self.hud.create_line(cx + inner * math.cos(angle), cy + inner * math.sin(angle),
-                                 cx + outer * math.cos(angle), cy + outer * math.sin(angle),
-                                 fill="#3faaa5" if index % 4 == 0 else "#174c59", tags="dynamic")
-        self.hud.create_text(26, height - 28, text=f"AUDIO STATE  //  {self.audio_mode.upper()}", anchor="w",
-                             fill="#f0c978" if self.audio_mode != "idle" else "#6e9fa5",
-                             font=("Consolas", 9, "bold"), tags="dynamic")
-        self.hud.create_text(width - 26, height - 28, text="LATENCY  024MS  //  LOCAL", anchor="e",
-                             fill="#527e89", font=("Consolas", 8), tags="dynamic")
-        bars = 30
-        bar_width, gap = max(2, (width * 0.56) / bars), 3
-        start_x = cx - (bars * (bar_width + gap)) / 2
-        for index in range(bars):
-            if self.audio_mode == "idle":
-                magnitude = 4 + abs(((index + self.wave_phase) % 9) - 4) * 2
-            else:
-                magnitude = 9 + ((index * 13 + self.wave_phase * 7) % 32)
-            self.hud.create_rectangle(start_x + index * (bar_width + gap), cy + radius + 58 - magnitude,
-                                       start_x + index * (bar_width + gap) + bar_width, cy + radius + 58,
-                                       fill="#38d8cf", outline="", tags="dynamic")
-
-    def animate_hud(self):
-        self.wave_phase = (self.wave_phase + 1) % 360
-        self.draw_hud()
-        self.root.after(55, self.animate_hud)
-
-    def submit(self):
-        query = self.command.get().strip()
-        if not query or self.command_running:
-            return
-        self.command.delete(0, "end")
-        self.write_log(f"YOU  > {query}", "user")
-        self.write_history(query)
-        self.set_command_state(False)
-        self.command_running = True
-        threading.Thread(target=self.process_command, args=(query,), daemon=True).start()
-
-    def process_command(self, query):
-        keep_running = self.assistant.handle(query)
-        self.root.after(0, lambda: self.command_finished(keep_running))
-
-    def command_finished(self, keep_running):
-        self.command_running = False
-        self.set_command_state(True)
-        if not keep_running:
-            self.root.after(350, self.close)
-
-    def set_command_state(self, enabled):
-        state = "normal" if enabled else "disabled"
-        self.command.configure(state=state)
-
-    def close(self):
-        self.assistant.shutdown()
-        self.root.destroy()
-
-    def start_voice(self):
-        if self.command_running or self.voice_running:
-            return
-        self.voice_running = True
-        self.audio_mode = "listening"
-        self.set_command_state(False)
-        self.voice_button.configure(state="disabled", text="LISTENING...")
-        self.write_log("Listening for a voice command...", "system")
-        threading.Thread(target=self.capture_voice, daemon=True).start()
-
-    def capture_voice(self):
-        query = self.assistant.listen(typed_fallback=False)
-        self.root.after(0, lambda: self.finish_voice_capture(query))
-
-    def finish_voice_capture(self, query):
-        self.voice_running = False
-        self.reset_audio_mode()
-        if query:
-            self.write_log(f"YOU  > {query}", "user")
-            self.write_history(query)
-            self.submit_voice(query)
-        else:
-            message = self.assistant.last_listen_error or "No voice command detected."
-            self.write_log(f"VOICE LINK // {message}", "system")
-            self.set_command_state(True)
-        self.voice_button.configure(state="normal", text="VOICE LINK")
-
-    def submit_voice(self, query):
-        if self.command_running:
-            return
-        self.command_running = True
-        self.set_command_state(False)
-        threading.Thread(target=self.process_command, args=(query,), daemon=True).start()
-
-    def run(self):
-        self.root.mainloop()
+            startup_command = f'"{sys.executable}" "{Path(__file__).resolve()}" --continuous'
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0,
+            winreg.KEY_SET_VALUE,
+        ) as startup_key:
+            winreg.SetValueEx(startup_key, "JARVIS", 0, winreg.REG_SZ, startup_command)
+    except OSError as error:
+        print(f"[startup] Could not register JARVIS for Windows login: {error}")
 
 
 def self_test():
@@ -945,13 +996,16 @@ def self_test():
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
         self_test()
-    elif "--terminal" in sys.argv:
-        try:
-            JarvisAssistant().run()
-        except KeyboardInterrupt:
-            print("\nJARVIS terminated by user.")
     else:
+        configure_windows_startup()
         try:
-            JarvisGUI().run()
+            if "--terminal" in sys.argv or "--continuous" in sys.argv:
+                JarvisAssistant().run(continuous="--continuous" in sys.argv)
+            elif JarvisWindow is None:
+                print("[ui] sci-fi HUD unavailable (customtkinter missing or broken); falling back to terminal mode.")
+                print("     Enable the sci-fi HUD with: python -m pip install customtkinter")
+                JarvisAssistant().run()
+            else:
+                JarvisWindow().run()
         except KeyboardInterrupt:
             print("\nJARVIS terminated by user.")
